@@ -1,0 +1,48 @@
+// Per-tenant cost allocation from App Insights traces.
+// Run in the App Insights resource Logs blade.
+// Prices below mirror app/pricing.py (Azure DI S0 list price, USD per 1,000 pages).
+// Update both files together if pricing changes.
+
+let unitPrice = datatable(model:string, usdPer1k:real)
+[
+    "prebuilt-read",         1.5,
+    "prebuilt-layout",      10.0,
+    "prebuilt-idDocument",  10.0,
+    "prebuilt-tax.us.w2",   10.0,
+    "prebuilt-tax.us.1098", 10.0,
+    "prebuilt-tax.us.1099", 10.0,
+    "custom",               30.0,
+    "classifier",            3.0
+];
+traces
+| where message == "di.pages.processed"
+| extend tenantId       = tostring(customDimensions.tenantId),
+         model          = tostring(customDimensions.model),
+         pages          = toint(customDimensions.pageCount),
+         durMs          = todouble(customDimensions.durationMs),
+         splitStrategy  = tostring(customDimensions.splitStrategy)
+| extend splitStrategy  = iff(isempty(splitStrategy), "unknown", splitStrategy)
+// Map custom-classifier model ids (anything not in the prebuilt list) to the "classifier" SKU.
+| extend priceKey       = iff(model startswith "prebuilt-" or model == "custom", model, "classifier")
+| join kind=leftouter unitPrice on $left.priceKey == $right.model
+| extend costUsd = (todouble(pages) / 1000.0) * coalesce(usdPer1k, 10.0)
+| summarize
+    pages          = sum(pages),
+    requests       = count(),
+    avgLatencyMs   = avg(durMs),
+    estCostUsd     = round(sum(costUsd), 4)
+  by tenantId, splitStrategy, model
+| order by tenantId asc, splitStrategy asc, estCostUsd desc
+
+// Side-by-side strategy comparison per tenant:
+// traces
+// | where message == "di.pages.processed"
+// | extend tenantId      = tostring(customDimensions.tenantId),
+//          splitStrategy = tostring(customDimensions.splitStrategy),
+//          pages         = toint(customDimensions.pageCount),
+//          model         = tostring(customDimensions.model)
+// | extend priceKey      = iff(model startswith "prebuilt-" or model == "custom", model, "classifier")
+// | join kind=leftouter unitPrice on $left.priceKey == $right.model
+// | extend costUsd = (todouble(pages) / 1000.0) * coalesce(usdPer1k, 10.0)
+// | summarize estCostUsd = round(sum(costUsd), 4), pages = sum(pages) by tenantId, splitStrategy
+// | evaluate pivot(splitStrategy, sum(estCostUsd))

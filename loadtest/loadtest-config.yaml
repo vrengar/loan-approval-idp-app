@@ -1,0 +1,25 @@
+version: v0.1
+testId: idp-baseline
+displayName: IDP baseline
+description: Multi-tenant baseline for IDP /process endpoint
+testPlan: loadtest.jmx
+configurationFiles:
+  - tenants.csv
+  - ../samples/loan_application_demo.pdf
+engineInstances: 2
+env:
+  - name: host
+    value: <REPLACE-WITH-CONTAINER-APP-FQDN>
+  - name: port
+    value: "443"
+  - name: scheme
+    value: https
+  - name: threads
+    value: "20"
+  - name: ramp
+    value: "60"
+  - name: duration
+    value: "600"
+failureCriteria:
+  - avg(response_time_ms) > 8000
+  - percentage(error) > 5

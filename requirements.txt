@@ -1,0 +1,13 @@
+fastapi>=0.115,<0.120
+uvicorn>=0.30,<0.40
+python-multipart>=0.0.12
+azure-ai-documentintelligence>=1.0.0,<2.0
+azure-identity>=1.17,<2.0
+pypdf>=5.0,<6.0
+reportlab>=4.2,<5.0
+pydantic>=2.9,<3.0
+pydantic-settings>=2.5,<3.0
+python-dotenv>=1.0,<2.0
+# Optional: enables App Insights telemetry. Requires MSVC build tools on
+# win-arm64 Python 3.13. Install separately on supported platforms:
+#   pip install "azure-monitor-opentelemetry>=1.6,<2.0"
