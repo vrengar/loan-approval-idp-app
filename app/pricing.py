@@ -29,7 +29,11 @@ Caveats:
       "Azure AI Document Intelligence").
 """
 
-# USD per 1,000 pages (S0 PAYG list price)
+# ---------------------------------------------------------------------------
+# Unit price table — USD per 1,000 pages, S0 Pay-As-You-Go list price.
+# Keep this in sync with loadtest/cost-allocation.kql (the KQL `unitPrice`
+# datatable mirrors this dict for off-line analytics).
+# ---------------------------------------------------------------------------
 UNIT_PRICE_PER_1K_PAGES = {
     # Read OCR — used only if you call prebuilt-read directly (not in default path)
     "prebuilt-read":         1.50,
@@ -44,7 +48,8 @@ UNIT_PRICE_PER_1K_PAGES = {
     "prebuilt-tax.us.1098": 10.00,
     "prebuilt-tax.us.1099": 10.00,
 
-    # Custom classification — used to detect doc boundaries + types in classifier mode
+    # Custom classification — used to detect doc boundaries + types in classifier mode.
+    # This is the headline savings driver: ~70% cheaper than prebuilt-layout for the split pass.
     "classifier":            3.00,
 
     # Custom extraction — used when you swap in a trained custom model
@@ -55,6 +60,11 @@ UNIT_PRICE_PER_1K_PAGES = {
 
 def estimate_cost_usd(model_id: str, pages: int) -> float:
     """Return an approximate USD cost for `pages` processed by `model_id`.
+
+    Called in two places:
+      1. Inline in main.py so the JSON response includes per-segment cost.
+      2. Inside telemetry.emit_pages_processed so App Insights traces carry
+         `estimatedCostUsd` as a queryable customDimension for chargeback.
 
     Falls back to the prebuilt/layout rate ($10/1k) for unknown model ids
     (e.g., custom model resource ids that don't match the table above).

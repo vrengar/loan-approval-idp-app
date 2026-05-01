@@ -20,9 +20,13 @@ def segments_from_classifier_result(result: Any) -> list[Segment]:
     DI's classifier returns one `documents[i]` per detected segment with:
       - doc_type  (matches one of the classifier's training class names)
       - bounding_regions[*].page_number  (1-based pages covered)
+
+    The output Segment shape is identical to the heuristic splitter's, so the
+    extraction loop in main._run_pipeline() doesn't care which strategy ran.
     """
     segments: list[Segment] = []
     for doc in (getattr(result, "documents", None) or []):
+        # Collect every page the classifier attributed to this document.
         pages = sorted({
             int(r.page_number)
             for r in (doc.bounding_regions or [])
@@ -32,12 +36,13 @@ def segments_from_classifier_result(result: Any) -> list[Segment]:
             continue
         doc_type = doc.doc_type or "unknown"
         # DI returns one document per contiguous span; trust its page range.
+        # Look up the routing table to pick the extraction model for this type.
         segments.append(Segment(
             doc_type=doc_type,
             page_start=pages[0],
             page_end=pages[-1],
             model_id=MODEL_BY_TYPE.get(doc_type, MODEL_BY_TYPE["unknown"]),
         ))
-    # Order by starting page just in case.
+    # Order by starting page just in case the classifier returns docs out of order.
     segments.sort(key=lambda s: s.page_start)
     return segments

@@ -12,13 +12,23 @@ from .config import settings
 
 
 class DIClient:
+    """Thin wrapper around the Azure DI SDK.
+
+    Auth strategy:
+      - If DI_KEY is set -> AzureKeyCredential (handy for local dev).
+      - Otherwise -> DefaultAzureCredential, which inside Container Apps
+        picks up the User-Assigned Managed Identity automatically (no secrets).
+    """
+
     def __init__(self) -> None:
         if not settings.di_endpoint:
             raise RuntimeError("DI_ENDPOINT must be set.")
         credential: Any
         if settings.di_key:
+            # Key auth — only recommended for local dev.
             credential = AzureKeyCredential(settings.di_key)
         else:
+            # Managed-identity / Entra ID auth — production path.
             try:
                 from azure.identity import DefaultAzureCredential
             except ImportError as e:
@@ -39,7 +49,15 @@ class DIClient:
         content: bytes,
         pages: str | None = None,
     ) -> tuple[AnalyzeResult, float]:
-        """Run an analyze operation. Returns (result, duration_ms)."""
+        """Run an analyze operation against any prebuilt or custom extraction model.
+
+        DI's analyze endpoint is async on the service side: begin_analyze_document()
+        returns a poller; .result() blocks until the operation completes (typically
+        5–30s depending on model + page count). We measure wall time so the
+        pipeline can stamp it on telemetry as `durationMs`.
+
+        Returns (result, duration_ms).
+        """
         start = time.perf_counter()
         poller = self._client.begin_analyze_document(
             model_id=model_id,
@@ -56,9 +74,14 @@ class DIClient:
         classifier_id: str,
         content: bytes,
     ) -> tuple[Any, float]:
-        """Run a classifier and return (result, duration_ms).
+        """Run a custom classifier (split + label in one call).
+
+        Used by the classifier-mode pipeline to detect document boundaries.
+        Cheaper meter ($3/1k pages) than the heuristic mode's prebuilt-layout
+        split pass ($10/1k).
 
         result.documents[i] has .doc_type and .bounding_regions[*].page_number.
+        Returns (result, duration_ms).
         """
         from azure.ai.documentintelligence.models import ClassifyDocumentRequest
         start = time.perf_counter()

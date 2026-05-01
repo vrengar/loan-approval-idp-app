@@ -21,9 +21,11 @@ from .telemetry import configure as configure_telemetry, emit_pages_processed
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("idp.api")
 
+# Wire OTel -> App Insights at import time so even startup logs are captured.
 configure_telemetry()
 app = FastAPI(title="IDP Demo — Loan Application Review")
 
+# Two strategies are supported on /process. "compare" runs both back-to-back.
 SplitStrategy = Literal["heuristic", "classifier"]
 
 
@@ -358,9 +360,21 @@ async def process(
     x_tenant_id: str | None = Header(default=None, alias="x-tenant-id"),
     mode: str = Query(default="heuristic"),
 ) -> JSONResponse:
+    """Main entry point. Accepts a merged loan-application PDF and returns
+    structured per-document extraction.
+
+    Inputs:
+      - file:        multipart upload (PDF)
+      - x-tenant-id: HTTP header identifying the SaaS tenant (for cost allocation)
+      - mode:        "heuristic" | "classifier" | "compare" (query string or form field)
+    """
+    # Reject non-PDF uploads early. octet-stream is allowed because some
+    # browsers / clients don't sniff the type.
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=415, detail="PDF required")
 
+    # Read multipart form once so we can pull both `tenantId` and `mode` fields
+    # from it (the HTML UI submits both as form fields).
     form = await request.form() if request.headers.get("content-type", "").startswith("multipart/") else {}
     # Resolve tenant in priority order: header > form field > "anonymous".
     # The HTML form posts the tenant under the field name "tenantId" (see UI markup).
@@ -377,8 +391,11 @@ async def process(
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    # Lazily build the DI client (returns 503 with a friendly message if misconfigured).
     di = _get_di()
 
+    # Compare mode runs BOTH strategies sequentially and returns side-by-side
+    # billing/segment data so the UI can show the savings story.
     if chosen_mode == "compare":
         h = _run_pipeline("heuristic",  di, pdf_bytes, tenant_id, file.filename)
         c = _run_pipeline("classifier", di, pdf_bytes, tenant_id, file.filename)
@@ -393,6 +410,7 @@ async def process(
     if chosen_mode not in ("heuristic", "classifier"):
         raise HTTPException(status_code=400, detail="mode must be heuristic, classifier, or compare")
 
+    # Single-strategy path.
     out = _run_pipeline(chosen_mode, di, pdf_bytes, tenant_id, file.filename)  # type: ignore[arg-type]
     return JSONResponse(out)
 
@@ -419,19 +437,37 @@ def _run_pipeline(
     tenant_id: str,
     filename: str | None,
 ) -> dict:
+    """Two-stage IDP pipeline: SPLIT (boundaries + types) then EXTRACT (per segment).
+
+    Stage 1 — Split pass:
+        heuristic   -> prebuilt-layout over whole doc + keyword classifier
+        classifier  -> custom classifier (single managed call, cheaper meter)
+
+    Stage 2 — Per-segment extraction:
+        slice the PDF down to each segment, then call the model picked by
+        MODEL_BY_TYPE (prebuilt-tax.us.w2 for W2s, prebuilt-idDocument for
+        IDs, prebuilt-layout otherwise).
+
+    Every DI call emits one `di.pages.processed` trace, all sharing a single
+    correlationId so they're easy to stitch together in App Insights.
+    """
+    # correlationId threads all telemetry rows for this request together.
     correlation_id = str(uuid.uuid4())
     log.info("pipeline start strategy=%s tenant=%s corr=%s", strategy, tenant_id, correlation_id)
     overall_start = time.perf_counter()
 
     # ---- Split pass ----
     if strategy == "heuristic":
+        # One DI call returns layout (text + structure) for every page.
         split_model = "prebuilt-layout"
         layout_result, split_ms = di.analyze(model_id=split_model, content=pdf_bytes)
         page_texts = di.page_text(layout_result)
         total_pages = len(page_texts)
+        # Keyword-score each page, then collapse runs of same-typed pages into segments.
         page_types = [classify_page(t) for t in page_texts]
         segments = segments_from_page_types(page_types)
     else:  # classifier
+        # Custom classifier required — fail fast with an actionable hint.
         if not settings.classifier_id:
             raise HTTPException(
                 status_code=503,
@@ -441,13 +477,17 @@ def _run_pipeline(
                 ),
             )
         split_model = settings.classifier_id  # logical model name for telemetry
-        # Classifier needs page count; quickly read locally.
+        # Classifier result doesn't expose total page count directly;
+        # read the PDF locally with pypdf (fast, no DI billing impact).
         total_pages = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
         cls_result, split_ms = di.classify(classifier_id=settings.classifier_id, content=pdf_bytes)
         segments = segments_from_classifier_result(cls_result)
 
+    # Pricing key differs from the model name: a custom classifier id like
+    # "idp-loan-docs-v1" maps to the "classifier" SKU ($3/1k), not its raw id.
     split_pricing_key = "classifier" if strategy == "classifier" else "prebuilt-layout"
     split_cost = estimate_cost_usd(split_pricing_key, total_pages)
+    # Telemetry row #1 for this request: the split pass.
     emit_pages_processed(
         tenant_id=tenant_id,
         model=split_model,
@@ -461,11 +501,16 @@ def _run_pipeline(
              [(s.doc_type, s.page_start, s.page_end) for s in segments])
 
     # ---- Per-segment extraction ----
+    # For each Segment, slice out just its pages, send to the model chosen by
+    # MODEL_BY_TYPE, and accumulate cost. One telemetry row per segment.
+    # NOTE: billed_pages = split-pass pages + sum(segment pages); the split
+    # pass and per-segment analyze are billed on separate meters by Azure DI.
     per_doc_results: list[dict] = []
     total_cost = split_cost
     billed_pages = total_pages
     reader = PdfReader(io.BytesIO(pdf_bytes))
     for seg in segments:
+        # Build a small PDF containing only this segment's pages.
         seg_bytes = _extract_pages(reader, seg.page_start, seg.page_end)
         result, dur_ms = di.analyze(model_id=seg.model_id, content=seg_bytes)
         seg_pages = seg.page_end - seg.page_start + 1
@@ -547,6 +592,11 @@ def _summarize_compare(h: dict, c: dict) -> dict:
 
 
 def _extract_pages(reader: PdfReader, start_1based: int, end_1based: int) -> bytes:
+    """Return a new PDF (as bytes) containing only pages [start..end] (1-based).
+
+    Used to send each segment to DI individually so we only pay for the right
+    model per page range (e.g., prebuilt-tax.us.w2 only for the W2 page).
+    """
     writer = PdfWriter()
     for i in range(start_1based - 1, end_1based):
         writer.add_page(reader.pages[i])
