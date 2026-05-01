@@ -52,5 +52,6 @@ def emit_pages_processed(
     }
     if extra:
         payload.update(extra)
-    # Logger output is captured by the OTel handler -> App Insights traces/customEvents.
-    _log.info("di.pages.processed", extra={"custom_dimensions": payload})
+    # Each key in `extra` becomes its own customDimension on the App Insights trace.
+    # (Don't wrap under a single 'custom_dimensions' key — that gets stringified.)
+    _log.info("di.pages.processed", extra=payload)
