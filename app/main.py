@@ -362,9 +362,11 @@ async def process(
         raise HTTPException(status_code=415, detail="PDF required")
 
     form = await request.form() if request.headers.get("content-type", "").startswith("multipart/") else {}
+    # Resolve tenant in priority order: header > form field > "anonymous".
+    # The HTML form posts the tenant under the field name "tenantId" (see UI markup).
     tenant_id = (
         x_tenant_id
-        or form.get("x-tenant-id-form")  # type: ignore[union-attr]
+        or (form.get("tenantId") if form else None)  # type: ignore[union-attr]
         or "anonymous"
     )
     # The HTML form posts mode as a form field; query param is the API path.
