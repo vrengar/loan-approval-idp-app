@@ -294,6 +294,81 @@ function compareResult(d) {{
     </div>`;
   const fieldsCol = (pillCls, pillLabel, run) => `
     <div><div style="margin-bottom:6px"><span class="pill ${{pillCls}}">${{pillLabel}}</span></div>${{fieldsBlock(run.segments) || '<div class="empty">No structured fields</div>'}}</div>`;
+
+  // Build a unified field-coverage matrix grouped by doc_type.
+  // For each doc_type that appears in ANY strategy, list all fields
+  // (union of names across H/C/CU) with one column per strategy showing
+  // value + confidence, or ✗ if missing. This is the headline quality view.
+  const matrixByType = (() => {{
+    const collect = (run) => {{
+      const out = {{}}; // doc_type -> { fieldName -> {value, confidence} }
+      for (const seg of (run.segments ?? [])) {{
+        for (const doc of (seg.documents ?? [])) {{
+          const t = doc.doc_type || seg.doc_type || 'unknown';
+          out[t] ??= {{}};
+          for (const [k, v] of Object.entries(doc.fields ?? {{}})) {{
+            // If a field appears in multiple docs of same type, keep the highest-confidence one.
+            const prev = out[t][k];
+            if (!prev || (v.confidence ?? 0) > (prev.confidence ?? 0)) out[t][k] = v;
+          }}
+        }}
+      }}
+      return out;
+    }};
+    const H = collect(h), C = collect(c), U = collect(u);
+    const types = Array.from(new Set([...Object.keys(H), ...Object.keys(C), ...Object.keys(U)])).sort();
+    return types.map(t => {{
+      const names = Array.from(new Set([
+        ...Object.keys(H[t] || {{}}),
+        ...Object.keys(C[t] || {{}}),
+        ...Object.keys(U[t] || {{}}),
+      ])).sort();
+      return {{ docType: t, fieldNames: names, H: H[t] || {{}}, C: C[t] || {{}}, U: U[t] || {{}} }};
+    }});
+  }})();
+  const cell = (v) => v == null
+    ? `<span style="color:var(--bad);font-weight:600">✗</span>`
+    : `<div>${{escape(v.value ?? '—')}}</div>${{v.confidence != null ? `<span class="conf ${{confClass(v.confidence)}}">${{v.confidence.toFixed(2)}}</span>` : ''}}`;
+  const matrixSection = matrixByType.length === 0
+    ? '<div class="empty">No structured fields extracted by any strategy</div>'
+    : matrixByType.map(g => {{
+        // Counts per strategy for the header
+        const cH = g.fieldNames.filter(n => g.H[n] != null).length;
+        const cC = g.fieldNames.filter(n => g.C[n] != null).length;
+        const cU = g.fieldNames.filter(n => g.U[n] != null).length;
+        const total = g.fieldNames.length;
+        const rows = g.fieldNames.map(n => {{
+          const present = [g.H[n], g.C[n], g.U[n]].filter(x => x != null).length;
+          const isGap = present > 0 && present < 3;  // some strategies missed it
+          const rowStyle = isGap ? 'background:#fffbe6' : '';
+          return `<tr style="${{rowStyle}}">
+            <td><b>${{escape(n)}}</b></td>
+            <td>${{cell(g.H[n])}}</td>
+            <td>${{cell(g.C[n])}}</td>
+            <td>${{cell(g.U[n])}}</td>
+          </tr>`;
+        }}).join('');
+        return `<div style="margin-top:14px">
+          <div style="margin-bottom:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            ${{chip(g.docType)}}
+            <span style="color:var(--muted);font-size:12px">
+              ${{total}} unique fields ·
+              <span class="pill h">H ${{cH}}/${{total}}</span>
+              <span class="pill c">C ${{cC}}/${{total}}</span>
+              <span class="pill u">CU ${{cU}}/${{total}}</span>
+            </span>
+          </div>
+          <table>
+            <thead><tr>
+              <th>Field</th>
+              <th><span class="pill h">HEURISTIC</span></th>
+              <th><span class="pill c">CLASSIFIER</span></th>
+              <th><span class="pill u">CU</span></th>
+            </tr></thead>
+            <tbody>${{rows}}</tbody>
+          </table>
+        </div>`;
+      }}).join('');
   return `
     <section class="card">
       <h2>Comparison summary</h2>
@@ -314,12 +389,11 @@ function compareResult(d) {{
     </section>
 
     <section class="card">
-      <h2>Extracted fields</h2>
-      <div class="grid cols-3">
-        ${{fieldsCol('h', 'HEURISTIC',  h)}}
-        ${{fieldsCol('c', 'CLASSIFIER', c)}}
-        ${{fieldsCol('u', 'CU',         u)}}
+      <h2>Extracted fields — coverage matrix</h2>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
+        Rows highlighted in yellow indicate a field that was extracted by at least one strategy but missed by another — these are quality gaps worth reviewing.
       </div>
+      ${{matrixSection}}
     </section>
 
     <details><summary>Raw JSON</summary><pre>${{escape(JSON.stringify(d, null, 2))}}</pre></details>
