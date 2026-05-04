@@ -94,11 +94,19 @@ class CUClient:
         )
         start = time.perf_counter()
 
-        # CU GA expects JSON with one of {url, base64Source, azureBlobSource}.
-        # We always have raw bytes locally (post-PDF-split), so base64-encode.
-        # NOTE: octet-stream POST returns 400 ContentEmpty on the GA API.
+        # CU GA schema (api-version=2025-11-01) requires:
+        #   { "inputs": [ { "data": "<base64>", "mimeType": "application/pdf" } ] }
+        # Earlier shapes (raw octet-stream, top-level base64Source, top-level url)
+        # all return 400 InvalidRequest on this api-version.
         import base64
-        body = {"base64Source": base64.b64encode(content).decode("ascii")}
+        body = {
+            "inputs": [
+                {
+                    "data": base64.b64encode(content).decode("ascii"),
+                    "mimeType": "application/pdf",
+                }
+            ]
+        }
         resp = requests.post(
             url,
             headers=self._headers(content_type="application/json"),
