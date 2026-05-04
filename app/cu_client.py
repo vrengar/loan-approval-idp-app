@@ -94,12 +94,15 @@ class CUClient:
         )
         start = time.perf_counter()
 
-        # Submit the analyze request. application/octet-stream lets CU sniff the
-        # input format (PDF, image, docx, ...) without us hard-coding it.
+        # CU GA expects JSON with one of {url, base64Source, azureBlobSource}.
+        # We always have raw bytes locally (post-PDF-split), so base64-encode.
+        # NOTE: octet-stream POST returns 400 ContentEmpty on the GA API.
+        import base64
+        body = {"base64Source": base64.b64encode(content).decode("ascii")}
         resp = requests.post(
             url,
-            headers=self._headers(content_type="application/octet-stream"),
-            data=content,
+            headers=self._headers(content_type="application/json"),
+            json=body,
             timeout=60,
         )
         if resp.status_code not in (200, 201, 202):
