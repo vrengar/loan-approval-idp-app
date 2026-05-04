@@ -58,6 +58,8 @@ UNIT_PRICE_PER_1K_PAGES = {
     "prebuilt-tax.us.w2":   10.00,
     "prebuilt-tax.us.1098": 10.00,
     "prebuilt-tax.us.1099": 10.00,
+    "prebuilt-payStub.us":      10.00,
+    "prebuilt-bankStatement.us": 10.00,
 
     # Custom classification — used to detect doc boundaries + types in classifier mode.
     # This is the headline savings driver: ~70% cheaper than prebuilt-layout for the split pass.

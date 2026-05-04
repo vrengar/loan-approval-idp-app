@@ -69,8 +69,8 @@ KEYWORDS = {
 # without touching the pipeline.
 MODEL_BY_TYPE = {
     "w2": "prebuilt-tax.us.w2",
-    "paystub": "prebuilt-layout",       # swap to a custom paystub model in prod
-    "bank_statement": "prebuilt-layout",  # swap to a custom bank-stmt model in prod
+    "paystub": "prebuilt-payStub.us",            # DI 4.0 GA prebuilt
+    "bank_statement": "prebuilt-bankStatement.us",  # DI 4.0 GA prebuilt
     "passport": "prebuilt-idDocument",
     "drivers_license": "prebuilt-idDocument",
     "unknown": "prebuilt-layout",
