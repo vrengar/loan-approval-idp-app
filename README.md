@@ -17,6 +17,8 @@ A Python (FastAPI) demo that processes **merged loan-application PDFs** (paystub
 
 > Full technical spec: [`docs/SPEC.md`](docs/SPEC.md). Classifier walkthrough: [`docs/custom-classifier.md`](docs/custom-classifier.md).
 
+> **Pricing disclaimer.** All cost values surfaced by this application — in API responses, the comparison UI, App Insights telemetry, and the KQL workbook — are **non-binding estimates** generated from a static rate table in [`app/pricing.py`](app/pricing.py). They are intended solely to illustrate relative cost differences between extraction strategies (Heuristic, Custom Classifier, Content Understanding) for demo and capacity-planning purposes. They do **not** reflect actual Azure invoicing, do not include downstream charges such as Azure OpenAI token consumption incurred by Content Understanding field extraction, and do not account for region, commitment-tier, or negotiated discounts. For authoritative pricing, refer to the official Azure pricing pages for [Document Intelligence](https://azure.microsoft.com/pricing/details/form-recognizer/) and [Content Understanding](https://azure.microsoft.com/pricing/details/content-understanding/), and to your Azure Cost Management billing data.
+
 ---
 
 ## Architecture (at a glance)
