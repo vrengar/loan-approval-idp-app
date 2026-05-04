@@ -1,10 +1,15 @@
 """App Insights / OpenTelemetry telemetry helpers.
 
-Emits a custom event `di.pages.processed` per request with:
-  tenantId, model, pageCount, estimatedCostUsd, durationMs
+Emits one custom event per IDP service call:
+  - `di.pages.processed`  — every Document Intelligence analyze/classify call
+  - `cu.calls.processed`  — every Content Understanding analyze call
 
-This is the *advanced* cost-tracking signal used by `loadtest/cost-allocation.kql`
-to allocate spend per SaaS tenant.
+Each row carries: tenantId, model/analyzer, pageCount, estimatedCostUsd,
+durationMs, priceVersion, service, plus any caller-supplied extras
+(correlationId, splitStrategy, docType, etc.).
+
+These are the *advanced* cost-tracking signals used by
+`loadtest/cost-allocation.kql` to allocate spend per SaaS tenant per service.
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ import os
 from typing import Any
 
 from .config import settings
-from .pricing import estimate_cost_usd
+from .pricing import PRICE_VERSION, estimate_cost_usd
 
 _log = logging.getLogger("idp.telemetry")
 _configured = False
@@ -62,6 +67,8 @@ def emit_pages_processed(
     cost = estimate_cost_usd(model, pages)
     payload = {
         "event": "di.pages.processed",
+        "service": "di",
+        "priceVersion": PRICE_VERSION,
         "tenantId": tenant_id,
         "model": model,
         "pageCount": pages,
@@ -77,3 +84,38 @@ def emit_pages_processed(
     # App Insights `traces` row, which is what makes
     # `tostring(customDimensions.tenantId)` work in KQL.
     _log.info("di.pages.processed", extra=payload)
+
+
+def emit_cu_call_processed(
+    *,
+    tenant_id: str,
+    analyzer_id: str,
+    pricing_key: str,
+    pages: int,
+    duration_ms: float,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Emit a `cu.calls.processed` trace row for a Content Understanding analyze call.
+
+    Mirrors `emit_pages_processed` so KQL can union both event types and
+    summarise per-tenant spend across DI and CU. `pricing_key` is the entry in
+    UNIT_PRICE_PER_1K_PAGES (e.g., "cu.prebuilt") used for the cost estimate;
+    `analyzer_id` is the actual CU analyzer name (e.g., "prebuilt-payStub.us")
+    kept as a separate dimension for human-readable filtering.
+    """
+    cost = estimate_cost_usd(pricing_key, pages)
+    payload = {
+        "event": "cu.calls.processed",
+        "service": "cu",
+        "priceVersion": PRICE_VERSION,
+        "tenantId": tenant_id,
+        "model": analyzer_id,         # mirror DI's column name for KQL union convenience
+        "pricingKey": pricing_key,    # the row in UNIT_PRICE_PER_1K_PAGES used
+        "pageCount": pages,
+        "estimatedCostUsd": cost,
+        "durationMs": round(duration_ms, 2),
+    }
+    if extra:
+        payload.update(extra)
+    _log.info("cu.calls.processed", extra=payload)
+

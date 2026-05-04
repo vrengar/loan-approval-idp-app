@@ -12,11 +12,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pypdf import PdfReader, PdfWriter
 
 from .config import settings
+from .cu_client import CUClient
 from .di_client import DIClient
 from .pricing import estimate_cost_usd
 from .splitter import classify_page, segments_from_page_types
 from .splitter_classifier import segments_from_classifier_result
-from .telemetry import configure as configure_telemetry, emit_pages_processed
+from .telemetry import (
+    configure as configure_telemetry,
+    emit_cu_call_processed,
+    emit_pages_processed,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("idp.api")
@@ -25,8 +30,22 @@ log = logging.getLogger("idp.api")
 configure_telemetry()
 app = FastAPI(title="IDP Demo — Loan Application Review")
 
-# Two strategies are supported on /process. "compare" runs both back-to-back.
-SplitStrategy = Literal["heuristic", "classifier"]
+# Three strategies are supported on /process. "compare" runs heuristic+classifier
+# back-to-back (the original 2-way savings story). "cu" runs Content Understanding.
+SplitStrategy = Literal["heuristic", "classifier", "cu"]
+
+# CU prebuilt analyzer routing. Mirrors splitter.MODEL_BY_TYPE but points to
+# Content Understanding analyzer ids instead of DI prebuilt model ids.
+# The ids below are confirmed available on the existing Foundry account.
+CU_ANALYZER_BY_TYPE: dict[str, str] = {
+    "paystub":         "prebuilt-payStub.us",
+    "bank_statement": "prebuilt-bankStatement.us",
+    "w2":              "prebuilt-tax.us.w2",
+    "drivers_license": "prebuilt-idDocument",
+    "passport":        "prebuilt-idDocument.passport",
+    # Generic fallback for unrecognised pages. CU also exposes prebuilt-layout.
+    "unknown":         "prebuilt-layout",
+}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -134,9 +153,10 @@ def index() -> str:
         <input name="tenantId" value="demo-tenant"/>
       </label>
       <div class="modes" role="radiogroup">
-        <label class="sel"><input type="radio" name="mode" value="heuristic" checked/> Heuristic</label>
-        <label><input type="radio" name="mode" value="classifier"/> Custom classifier</label>
-        <label><input type="radio" name="mode" value="compare"/> Compare both</label>
+        <label class="sel"><input type="radio" name="mode" value="heuristic" checked/> Heuristic (DI)</label>
+        <label><input type="radio" name="mode" value="classifier"/> Custom classifier (DI)</label>
+        <label><input type="radio" name="mode" value="cu"/> Content Understanding</label>
+        <label><input type="radio" name="mode" value="compare"/> Compare DI both</label>
       </div>
       <label class="field" style="flex:1">PDF file
         <input type="file" name="file" accept="application/pdf" required/>
@@ -407,8 +427,11 @@ async def process(
             "classifier": c,
         })
 
-    if chosen_mode not in ("heuristic", "classifier"):
-        raise HTTPException(status_code=400, detail="mode must be heuristic, classifier, or compare")
+    if chosen_mode not in ("heuristic", "classifier", "cu"):
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be heuristic, classifier, cu, or compare",
+        )
 
     # Single-strategy path.
     out = _run_pipeline(chosen_mode, di, pdf_bytes, tenant_id, file.filename)  # type: ignore[arg-type]
@@ -442,15 +465,22 @@ def _run_pipeline(
     Stage 1 — Split pass:
         heuristic   -> prebuilt-layout over whole doc + keyword classifier
         classifier  -> custom classifier (single managed call, cheaper meter)
+        cu          -> heuristic split (DI prebuilt-layout) then CU prebuilts for extraction
 
     Stage 2 — Per-segment extraction:
         slice the PDF down to each segment, then call the model picked by
         MODEL_BY_TYPE (prebuilt-tax.us.w2 for W2s, prebuilt-idDocument for
         IDs, prebuilt-layout otherwise).
 
-    Every DI call emits one `di.pages.processed` trace, all sharing a single
-    correlationId so they're easy to stitch together in App Insights.
+    Every DI call emits one `di.pages.processed` trace; CU calls emit
+    `cu.calls.processed`. All rows in a single request share one correlationId
+    so they're easy to stitch together in App Insights.
     """
+    # cu strategy has its own orchestration (mixes DI for split, CU for extract);
+    # delegate to a dedicated function to keep the DI-only pipeline readable.
+    if strategy == "cu":
+        return _run_cu_pipeline(di, pdf_bytes, tenant_id, filename)
+
     # correlationId threads all telemetry rows for this request together.
     correlation_id = str(uuid.uuid4())
     log.info("pipeline start strategy=%s tenant=%s corr=%s", strategy, tenant_id, correlation_id)
@@ -603,3 +633,142 @@ def _extract_pages(reader: PdfReader, start_1based: int, end_1based: int) -> byt
     buf = io.BytesIO()
     writer.write(buf)
     return buf.getvalue()
+
+
+# ---------- Content Understanding pipeline ----------
+
+def _get_cu() -> CUClient:
+    """Lazy-build the CU client. Returns 503 with a friendly hint on misconfig."""
+    try:
+        return CUClient()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Content Understanding not configured: {exc}. "
+                "Set CU_ENDPOINT (or reuse DI_ENDPOINT on the same Foundry resource) and restart."
+            ),
+        ) from exc
+
+
+def _run_cu_pipeline(
+    di: DIClient,
+    pdf_bytes: bytes,
+    tenant_id: str,
+    filename: str | None,
+) -> dict:
+    """CU strategy: heuristic split (DI prebuilt-layout) + per-segment CU prebuilt extraction.
+
+    The split pass still uses DI's prebuilt-layout (cheapest reliable way to get
+    per-page text for the keyword classifier, and emits a `di.pages.processed`
+    row for cost transparency). Per-segment extraction then routes each segment
+    to a Content Understanding prebuilt analyzer (e.g., prebuilt-payStub.us)
+    via CUClient and emits one `cu.calls.processed` row per segment.
+
+    Result shape mirrors the DI pipelines so the existing UI renders it
+    unchanged. `splitStrategy` is reported as "cu" so KQL can group by it.
+    """
+    cu = _get_cu()
+    correlation_id = str(uuid.uuid4())
+    log.info("cu pipeline start tenant=%s corr=%s", tenant_id, correlation_id)
+    overall_start = time.perf_counter()
+
+    # ---- Split pass (DI prebuilt-layout, same as heuristic mode) ----
+    split_model = "prebuilt-layout"
+    layout_result, split_ms = di.analyze(model_id=split_model, content=pdf_bytes)
+    page_texts = di.page_text(layout_result)
+    total_pages = len(page_texts)
+    page_types = [classify_page(t) for t in page_texts]
+    segments = segments_from_page_types(page_types)
+
+    split_pricing_key = "prebuilt-layout"
+    split_cost = estimate_cost_usd(split_pricing_key, total_pages)
+    # Telemetry row #1: the DI split pass (di.* event so it shows up alongside
+    # heuristic-mode rows in the cost-allocation KQL).
+    emit_pages_processed(
+        tenant_id=tenant_id,
+        model=split_model,
+        pages=total_pages,
+        duration_ms=split_ms,
+        extra={"correlationId": correlation_id, "stage": "split", "splitStrategy": "cu"},
+    )
+
+    log.info("cu segments tenant=%s segments=%s",
+             tenant_id, [(s.doc_type, s.page_start, s.page_end) for s in segments])
+
+    # ---- Per-segment extraction via CU prebuilts ----
+    per_doc_results: list[dict] = []
+    total_cost = split_cost
+    billed_pages = total_pages
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    for seg in segments:
+        # Map detected doc_type -> CU analyzer id. Falls back to prebuilt-layout
+        # for unknown segments so we still return *something* per page range.
+        analyzer_id = CU_ANALYZER_BY_TYPE.get(seg.doc_type, CU_ANALYZER_BY_TYPE["unknown"])
+        seg_bytes = _extract_pages(reader, seg.page_start, seg.page_end)
+        result, dur_ms = cu.analyze(analyzer_id=analyzer_id, content=seg_bytes)
+        seg_pages = seg.page_end - seg.page_start + 1
+        # All current routes are CU prebuilts -> "cu.prebuilt" pricing key.
+        seg_cost = estimate_cost_usd("cu.prebuilt", seg_pages)
+        total_cost += seg_cost
+        billed_pages += seg_pages
+        emit_cu_call_processed(
+            tenant_id=tenant_id,
+            analyzer_id=analyzer_id,
+            pricing_key="cu.prebuilt",
+            pages=seg_pages,
+            duration_ms=dur_ms,
+            extra={
+                "correlationId": correlation_id,
+                "docType": seg.doc_type,
+                "pageStart": seg.page_start,
+                "pageEnd": seg.page_end,
+                "splitStrategy": "cu",
+            },
+        )
+        per_doc_results.append({
+            "doc_type": seg.doc_type,
+            "model_id": analyzer_id,        # mirror DI shape; UI renders it as <code>
+            "page_range": [seg.page_start, seg.page_end],
+            "pages": seg_pages,
+            "duration_ms": round(dur_ms, 2),
+            "cost_estimate_usd": seg_cost,
+            "documents": cu.summarize_fields(result),
+        })
+
+    overall_ms = (time.perf_counter() - overall_start) * 1000.0
+
+    # Aggregate per-model usage for the "Models used" panel in the UI.
+    models_used: dict[str, dict[str, int]] = {}
+    def _bump(model: str, pages: int) -> None:
+        slot = models_used.setdefault(model, {"calls": 0, "pages": 0})
+        slot["calls"] += 1
+        slot["pages"] += pages
+    _bump(split_model, total_pages)
+    for seg in segments:
+        analyzer_id = CU_ANALYZER_BY_TYPE.get(seg.doc_type, CU_ANALYZER_BY_TYPE["unknown"])
+        _bump(analyzer_id, seg.page_end - seg.page_start + 1)
+    models_used_list = [
+        {"model_id": m, "calls": v["calls"], "pages": v["pages"]}
+        for m, v in sorted(models_used.items())
+    ]
+
+    return {
+        "correlationId": correlation_id,
+        "tenantId": tenant_id,
+        "filename": filename,
+        "splitStrategy": "cu",
+        "totalPages": total_pages,
+        "totalDurationMs": round(overall_ms, 2),
+        "modelsUsed": models_used_list,
+        "billing": {
+            "billedPages": billed_pages,
+            "splitPassPages": total_pages,
+            "splitPassModel": split_model,
+            "splitPassPricingKey": split_pricing_key,
+            "splitPassCostEstimateUsd": round(split_cost, 6),
+            "totalCostEstimateUsd": round(total_cost, 6),
+            "note": "Approximate. DI split pass + per-segment CU analyze are billed on separate meters.",
+        },
+        "segments": per_doc_results,
+    }
