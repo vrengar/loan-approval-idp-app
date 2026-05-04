@@ -30,8 +30,8 @@ log = logging.getLogger("idp.api")
 configure_telemetry()
 app = FastAPI(title="IDP Demo — Loan Application Review")
 
-# Three strategies are supported on /process. "compare" runs heuristic+classifier
-# back-to-back (the original 2-way savings story). "cu" runs Content Understanding.
+# Three strategies are supported on /process. "compare" runs all three
+# (heuristic, classifier, cu) back-to-back for side-by-side cost/latency.
 SplitStrategy = Literal["heuristic", "classifier", "cu"]
 
 # CU prebuilt analyzer routing. Mirrors splitter.MODEL_BY_TYPE but points to
@@ -96,6 +96,8 @@ def index() -> str:
   .btn:disabled{{opacity:.5;cursor:not-allowed}}
   .btn.ghost{{background:#fff;color:var(--ink);border:1px solid var(--line)}}
   .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
+  .grid.cols-3{{grid-template-columns:repeat(3,1fr)}}
+  @media (max-width:1100px){{.grid.cols-3{{grid-template-columns:1fr}}}}
   @media (max-width:900px){{.grid{{grid-template-columns:1fr}}}}
   .kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}}
   @media (max-width:700px){{.kpis{{grid-template-columns:repeat(2,1fr)}}}}
@@ -119,6 +121,7 @@ def index() -> str:
   .pill{{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;font-weight:600}}
   .pill.h{{background:var(--warn-soft);color:var(--warn)}}
   .pill.c{{background:var(--brand-soft);color:var(--brand)}}
+  .pill.u{{background:#e6f6ee;color:#0a6a3f}}
   .conf{{display:inline-block;width:36px;text-align:right;font-variant-numeric:tabular-nums}}
   .conf.lo{{color:var(--bad)}} .conf.mid{{color:var(--warn)}} .conf.hi{{color:var(--good)}}
   .seg-list{{display:flex;flex-direction:column;gap:6px}}
@@ -135,6 +138,7 @@ def index() -> str:
   .err{{background:var(--bad-soft);color:var(--bad);padding:12px;border-radius:8px;border:1px solid #f3c4c1}}
   .strategy-h{{border-left:3px solid var(--warn)}}
   .strategy-c{{border-left:3px solid var(--brand)}}
+  .strategy-u{{border-left:3px solid #0a6a3f}}
 </style>
 </head>
 <body>
@@ -156,7 +160,7 @@ def index() -> str:
         <label class="sel"><input type="radio" name="mode" value="heuristic" checked/> Heuristic (DI)</label>
         <label><input type="radio" name="mode" value="classifier"/> Custom classifier (DI)</label>
         <label><input type="radio" name="mode" value="cu"/> Content Understanding</label>
-        <label><input type="radio" name="mode" value="compare"/> Compare DI both</label>
+        <label><input type="radio" name="mode" value="compare"/> Compare all 3</label>
       </div>
       <label class="field" style="flex:1">PDF file
         <input type="file" name="file" accept="application/pdf" required/>
@@ -258,74 +262,63 @@ function singleResult(r) {{
 }}
 
 function compareResult(d) {{
-  const cmp = d.comparison, h = d.heuristic, c = d.classifier;
-  const dCost = cmp.totalCostUsd.savingsUsd;
-  const dPct = cmp.totalCostUsd.savingsPct;
-  const dDur = h.totalDurationMs - c.totalDurationMs;
-  const dDurPct = h.totalDurationMs ? (dDur / h.totalDurationMs * 100) : 0;
-  const sign = v => v > 0 ? '−' : '+'; // savings shown as negative cost
+  const cmp = d.comparison, h = d.heuristic, c = d.classifier, u = d.cu;
+  const col = (label, cls, run, baselineCost, baselineDur) => {{
+    const dCost = baselineCost - run.billing.totalCostEstimateUsd;
+    const dDur  = baselineDur  - run.totalDurationMs;
+    const dCostPct = baselineCost ? (dCost / baselineCost * 100) : 0;
+    const dDurPct  = baselineDur  ? (dDur  / baselineDur  * 100) : 0;
+    const sign = v => v > 0 ? '−' : '+';
+    const showDelta = baselineCost !== run.billing.totalCostEstimateUsd;
+    return `
+      <div class="kpi">
+        <div class="lbl">${{label}}</div>
+        <div class="val">${{fmtUsd(run.billing.totalCostEstimateUsd)}}</div>
+        ${{showDelta ? `<div class="delta ${{dCost>0?'good':'bad'}}">${{sign(dCost)}}${{fmtUsd(Math.abs(dCost))}} (${{dCostPct.toFixed(1)}}%) vs heuristic</div>` : ''}}
+        <div class="lbl" style="margin-top:8px">Duration</div>
+        <div class="val" style="font-size:16px">${{fmtMs(run.totalDurationMs)}}</div>
+        ${{showDelta ? `<div class="delta ${{dDur>0?'good':'bad'}}">${{sign(dDur)}}${{fmtMs(Math.abs(dDur))}} (${{dDurPct.toFixed(1)}}%) vs heuristic</div>` : ''}}
+      </div>`;
+  }};
+  const segCol = (pillCls, pillLabel, stratCls, run) => `
+    <div>
+      <div style="margin-bottom:8px"><span class="pill ${{pillCls}}">${{pillLabel}}</span>
+        <span style="color:var(--muted);font-size:12px;margin-left:6px">${{run.segments.length}} segments</span></div>
+      <div class="seg-list">${{run.segments.map(s => `
+        <div class="seg-row ${{stratCls}}">
+          ${{chip(s.doc_type)}}
+          <span class="pages">p${{s.page_range[0]}}${{s.page_range[1]!==s.page_range[0]?'–'+s.page_range[1]:''}}</span>
+          <code style="font-size:11px;color:var(--muted)">${{escape(s.model_id)}}</code>
+          <span style="margin-left:auto;color:var(--muted);font-size:12px">${{fmtUsd(s.cost_estimate_usd)}}</span>
+        </div>`).join('')}}</div>
+    </div>`;
+  const fieldsCol = (pillCls, pillLabel, run) => `
+    <div><div style="margin-bottom:6px"><span class="pill ${{pillCls}}">${{pillLabel}}</span></div>${{fieldsBlock(run.segments) || '<div class="empty">No structured fields</div>'}}</div>`;
   return `
     <section class="card">
       <h2>Comparison summary</h2>
-      <div class="kpis">
-        <div class="kpi">
-          <div class="lbl">Cost — heuristic</div>
-          <div class="val">${{fmtUsd(cmp.totalCostUsd.heuristic)}}</div>
-        </div>
-        <div class="kpi">
-          <div class="lbl">Cost — classifier</div>
-          <div class="val">${{fmtUsd(cmp.totalCostUsd.classifier)}}</div>
-          <div class="delta ${{dCost>0?'good':'bad'}}">
-            ${{sign(dCost)}}${{fmtUsd(Math.abs(dCost))}} (${{dPct.toFixed(1)}}%) vs heuristic
-          </div>
-        </div>
-        <div class="kpi">
-          <div class="lbl">Duration — heuristic</div>
-          <div class="val">${{fmtMs(h.totalDurationMs)}}</div>
-        </div>
-        <div class="kpi">
-          <div class="lbl">Duration — classifier</div>
-          <div class="val">${{fmtMs(c.totalDurationMs)}}</div>
-          <div class="delta ${{dDur>0?'good':'bad'}}">
-            ${{sign(dDur)}}${{fmtMs(Math.abs(dDur))}} (${{dDurPct.toFixed(1)}}%) vs heuristic
-          </div>
-        </div>
+      <div class="kpis" style="grid-template-columns:repeat(3,1fr)">
+        ${{col('Heuristic (DI)',  'h', h, h.billing.totalCostEstimateUsd, h.totalDurationMs)}}
+        ${{col('Classifier (DI)', 'c', c, h.billing.totalCostEstimateUsd, h.totalDurationMs)}}
+        ${{col('Content Understanding', 'u', u, h.billing.totalCostEstimateUsd, h.totalDurationMs)}}
       </div>
     </section>
 
     <section class="card">
       <h2>Detected segments side-by-side</h2>
-      <div class="grid">
-        <div>
-          <div style="margin-bottom:8px"><span class="pill h">HEURISTIC</span>
-            <span style="color:var(--muted);font-size:12px;margin-left:6px">${{h.segments.length}} segments</span></div>
-          <div class="seg-list">${{h.segments.map(s => `
-            <div class="seg-row strategy-h">
-              ${{chip(s.doc_type)}}
-              <span class="pages">p${{s.page_range[0]}}${{s.page_range[1]!==s.page_range[0]?'–'+s.page_range[1]:''}}</span>
-              <code style="font-size:11px;color:var(--muted)">${{escape(s.model_id)}}</code>
-              <span style="margin-left:auto;color:var(--muted);font-size:12px">${{fmtUsd(s.cost_estimate_usd)}}</span>
-            </div>`).join('')}}</div>
-        </div>
-        <div>
-          <div style="margin-bottom:8px"><span class="pill c">CLASSIFIER</span>
-            <span style="color:var(--muted);font-size:12px;margin-left:6px">${{c.segments.length}} segments</span></div>
-          <div class="seg-list">${{c.segments.map(s => `
-            <div class="seg-row strategy-c">
-              ${{chip(s.doc_type)}}
-              <span class="pages">p${{s.page_range[0]}}${{s.page_range[1]!==s.page_range[0]?'–'+s.page_range[1]:''}}</span>
-              <code style="font-size:11px;color:var(--muted)">${{escape(s.model_id)}}</code>
-              <span style="margin-left:auto;color:var(--muted);font-size:12px">${{fmtUsd(s.cost_estimate_usd)}}</span>
-            </div>`).join('')}}</div>
-        </div>
+      <div class="grid cols-3">
+        ${{segCol('h', 'HEURISTIC',  'strategy-h', h)}}
+        ${{segCol('c', 'CLASSIFIER', 'strategy-c', c)}}
+        ${{segCol('u', 'CU',         'strategy-u', u)}}
       </div>
     </section>
 
     <section class="card">
       <h2>Extracted fields</h2>
-      <div class="grid">
-        <div><div style="margin-bottom:6px"><span class="pill h">HEURISTIC</span></div>${{fieldsBlock(h.segments) || '<div class="empty">No structured fields</div>'}}</div>
-        <div><div style="margin-bottom:6px"><span class="pill c">CLASSIFIER</span></div>${{fieldsBlock(c.segments) || '<div class="empty">No structured fields</div>'}}</div>
+      <div class="grid cols-3">
+        ${{fieldsCol('h', 'HEURISTIC',  h)}}
+        ${{fieldsCol('c', 'CLASSIFIER', c)}}
+        ${{fieldsCol('u', 'CU',         u)}}
       </div>
     </section>
 
@@ -414,17 +407,19 @@ async def process(
     # Lazily build the DI client (returns 503 with a friendly message if misconfigured).
     di = _get_di()
 
-    # Compare mode runs BOTH strategies sequentially and returns side-by-side
+    # Compare mode runs ALL THREE strategies sequentially and returns side-by-side
     # billing/segment data so the UI can show the savings story.
     if chosen_mode == "compare":
         h = _run_pipeline("heuristic",  di, pdf_bytes, tenant_id, file.filename)
         c = _run_pipeline("classifier", di, pdf_bytes, tenant_id, file.filename)
+        u = _run_pipeline("cu",         di, pdf_bytes, tenant_id, file.filename)
         return JSONResponse({
             "tenantId": tenant_id,
             "filename": file.filename,
-            "comparison": _summarize_compare(h, c),
+            "comparison": _summarize_compare(h, c, u),
             "heuristic": h,
             "classifier": c,
+            "cu": u,
         })
 
     if chosen_mode not in ("heuristic", "classifier", "cu"):
@@ -606,18 +601,26 @@ def _run_pipeline(
     }
 
 
-def _summarize_compare(h: dict, c: dict) -> dict:
+def _summarize_compare(h: dict, c: dict, u: dict) -> dict:
     h_cost = h["billing"]["totalCostEstimateUsd"]
     c_cost = c["billing"]["totalCostEstimateUsd"]
+    u_cost = u["billing"]["totalCostEstimateUsd"]
+    def _sav(base: float, other: float) -> dict:
+        return {
+            "savingsUsd": round(base - other, 6),
+            "savingsPct": round((base - other) / base * 100, 1) if base else 0.0,
+        }
     return {
-        "billedPages":       {"heuristic": h["billing"]["billedPages"], "classifier": c["billing"]["billedPages"]},
-        "totalCostUsd":      {"heuristic": h_cost, "classifier": c_cost,
-                              "savingsUsd": round(h_cost - c_cost, 6),
-                              "savingsPct": round((h_cost - c_cost) / h_cost * 100, 1) if h_cost else 0.0},
-        "totalDurationMs":   {"heuristic": h["totalDurationMs"], "classifier": c["totalDurationMs"]},
-        "segmentCount":      {"heuristic": len(h["segments"]),  "classifier": len(c["segments"])},
-        "segmentDocTypes":   {"heuristic": [s["doc_type"] for s in h["segments"]],
-                              "classifier": [s["doc_type"] for s in c["segments"]]},
+        "billedPages":     {"heuristic": h["billing"]["billedPages"], "classifier": c["billing"]["billedPages"], "cu": u["billing"]["billedPages"]},
+        "totalCostUsd":    {"heuristic": h_cost, "classifier": c_cost, "cu": u_cost,
+                            "classifierVsHeuristic": _sav(h_cost, c_cost),
+                            "cuVsHeuristic":         _sav(h_cost, u_cost),
+                            "cuVsClassifier":        _sav(c_cost, u_cost)},
+        "totalDurationMs": {"heuristic": h["totalDurationMs"], "classifier": c["totalDurationMs"], "cu": u["totalDurationMs"]},
+        "segmentCount":    {"heuristic": len(h["segments"]),  "classifier": len(c["segments"]), "cu": len(u["segments"])},
+        "segmentDocTypes": {"heuristic":  [s["doc_type"] for s in h["segments"]],
+                            "classifier": [s["doc_type"] for s in c["segments"]],
+                            "cu":         [s["doc_type"] for s in u["segments"]]},
     }
 
 
