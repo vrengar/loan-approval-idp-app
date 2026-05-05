@@ -5,7 +5,6 @@ import io
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
@@ -482,16 +481,14 @@ async def process(
     # Lazily build the DI client (returns 503 with a friendly message if misconfigured).
     di = _get_di()
 
-    # Compare mode runs ALL THREE strategies in parallel threads. Each pipeline
-    # is I/O-bound (DI / CU REST polling), so threads cut wall time from
-    # sum(H,C,U) to ~max(H,C,U). DIClient/CUClient instances are not shared
-    # across threads internally (each request builds its own requests.Session).
+    # Compare mode runs ALL THREE strategies sequentially. We tried thread
+    # parallelism here but a single AI Services account throttles concurrent
+    # DI+CU requests, which triggers SDK retry/backoff and made wall time
+    # *worse*, not better. Sequential is the safer demo path.
     if chosen_mode == "compare":
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            fh = pool.submit(_run_pipeline, "heuristic",  di, pdf_bytes, tenant_id, file.filename)
-            fc = pool.submit(_run_pipeline, "classifier", di, pdf_bytes, tenant_id, file.filename)
-            fu = pool.submit(_run_pipeline, "cu",         di, pdf_bytes, tenant_id, file.filename)
-            h, c, u = fh.result(), fc.result(), fu.result()
+        h = _run_pipeline("heuristic",  di, pdf_bytes, tenant_id, file.filename)
+        c = _run_pipeline("classifier", di, pdf_bytes, tenant_id, file.filename)
+        u = _run_pipeline("cu",         di, pdf_bytes, tenant_id, file.filename)
         return JSONResponse({
             "tenantId": tenant_id,
             "filename": file.filename,
