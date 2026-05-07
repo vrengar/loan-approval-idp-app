@@ -21,6 +21,7 @@ param apiImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:la
 
 @description('Custom classifier id for the alternative split strategy. Empty disables that mode.')
 param classifierId string = ''
+param cuRouterAnalyzerId string = ''
 
 var tags = {
   app: 'idp-demo'
@@ -42,6 +43,7 @@ module main 'modules/resources.bicep' = {
     tags: tags
     apiImage: apiImage
     classifierId: classifierId
+    cuRouterAnalyzerId: cuRouterAnalyzerId
   }
 }
 

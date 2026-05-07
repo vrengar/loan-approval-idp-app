@@ -5,6 +5,7 @@ param envName string
 param tags object
 param apiImage string
 param classifierId string = ''
+param cuRouterAnalyzerId string = ''
 
 var suffix = uniqueString(resourceGroup().id, envName)
 
@@ -148,8 +149,14 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'api'
           image: apiImage
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            // Bumped from 0.5/1Gi -> 2/4Gi. The /compare endpoint fans out
+            // three pipelines in parallel (heuristic, classifier, cu) and
+            // each does base64 PDF encoding + LRO polling threads + JSON
+            // parsing of multi-segment responses. 0.5 vCPU was a constraint
+            // on orchestration throughput; CU service-side latency is still
+            // the wall-clock floor.
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: [
             { name: 'DI_ENDPOINT', value: di.properties.endpoint }
@@ -157,12 +164,16 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appi.properties.ConnectionString }
             { name: 'TENANT_ID_HEADER', value: 'x-tenant-id' }
             { name: 'CLASSIFIER_ID', value: classifierId }
+            { name: 'CU_ROUTER_ANALYZER_ID', value: cuRouterAnalyzerId }
             { name: 'PORT', value: '8000' }
           ]
         }
       ]
       scale: {
-        minReplicas: 1
+        // minReplicas 2 keeps a warm pod so the first /compare request after
+        // an idle period doesn't pay cold-start cost. maxReplicas 10 covers
+        // bursty load test traffic.
+        minReplicas: 2
         maxReplicas: 10
         rules: [
           {

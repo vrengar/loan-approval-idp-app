@@ -6,3 +6,8 @@ __pycache__/
 samples/*.pdf
 !samples/.gitkeep
 !samples/loan_application_demo.pdf
+
+# Local response dumps & ad-hoc demo artefacts (do not commit)
+resp.json
+cu_resp.json
+loan_packet_demo.pdf

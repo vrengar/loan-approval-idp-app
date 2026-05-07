@@ -30,10 +30,14 @@ from .config import settings
 CU_API_VERSION = "2025-11-01"
 
 # Conservative default polling cadence. CU analyze for a multi-page PDF
-# typically completes in 5-30 s; we sleep briefly between polls.
+# typically completes in 5-30 s, but a router analyzer doing
+# split+classify+route+extract on a multi-doc loan packet can take 90-180 s
+# under normal load and occasionally spike higher. 600 s leaves enough
+# headroom for service variability without holding the HTTP connection
+# beyond the Container Apps ingress idle timeout.
 _POLL_INITIAL_SECONDS = 1.0
 _POLL_MAX_SECONDS = 4.0
-_POLL_TIMEOUT_SECONDS = 180.0
+_POLL_TIMEOUT_SECONDS = 600.0
 
 
 class CUClient:
@@ -79,12 +83,24 @@ class CUClient:
         return h
 
     # --------------------------------------------------------------- public API
-    def analyze(self, *, analyzer_id: str, content: bytes) -> tuple[dict[str, Any], float]:
+    def analyze(
+        self,
+        *,
+        analyzer_id: str,
+        content: bytes,
+        enable_segment: bool = False,
+    ) -> tuple[dict[str, Any], float]:
         """Submit a binary document to a CU analyzer and return (result, duration_ms).
 
         Implements the standard async LRO pattern:
           POST :analyze  ->  202 Accepted with Operation-Location header
           GET  {op-loc}  ->  poll until status == "Succeeded" / "Failed"
+
+        When `enable_segment=True` (only meaningful for classifier analyzers
+        that define `contentCategories`), the service splits the input PDF
+        across the declared categories and — if each category sets an
+        `analyzerId` — also routes each segment to the matching extractor.
+        One HTTP call replaces the classify/split/route loop.
 
         The returned dict is the raw JSON `result` payload; main.py adapts it.
         """
@@ -99,7 +115,7 @@ class CUClient:
         # Earlier shapes (raw octet-stream, top-level base64Source, top-level url)
         # all return 400 InvalidRequest on this api-version.
         import base64
-        body = {
+        body: dict[str, Any] = {
             "inputs": [
                 {
                     "data": base64.b64encode(content).decode("ascii"),
@@ -107,6 +123,10 @@ class CUClient:
                 }
             ]
         }
+        if enable_segment:
+            # Tells the classifier analyzer to detect doc boundaries and
+            # return one entry per segment in result.contents[].
+            body["enableSegment"] = True
         resp = requests.post(
             url,
             headers=self._headers(content_type="application/json"),
@@ -208,6 +228,86 @@ class CUClient:
             elif isinstance(item.get("pages"), int):
                 pages = max(pages, item["pages"])
         return pages
+
+    @staticmethod
+    def segments_from_router_result(
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Walk a routed-classifier response into per-segment dicts.
+
+        Used by the `cu` strategy in main.py when calling a `contentCategories`-
+        style analyzer with `enableSegment=true` and `analyzerId` set per
+        category. CU returns one `contents[]` entry per detected segment,
+        each carrying:
+          - `category` (or `kind`) -- the matched contentCategories key
+          - `pageRange` { start, end } OR `pages` "start-end"
+          - `fields` -- already extracted by the routed analyzer
+          - `confidence` -- classification confidence for the segment
+
+        Output shape matches the per-segment dicts the UI already renders:
+          { doc_type, category, page_start, page_end, pages, confidence,
+            analyzer_id, fields }
+        """
+        out: list[dict[str, Any]] = []
+        contents = (((result or {}).get("result") or {}).get("contents")) or []
+        for item in contents:
+            # CU GA returns the parent base-analyzer (`prebuilt-document`)
+            # output as `contents[0]` with `kind: "document"`, no `category`,
+            # and the routed sub-document analyzer that was hit echoes the
+            # ROUTER's analyzerId (loan_docs_router) -- not a real prebuilt.
+            # Skip that wrapper so callers see only the routed segments.
+            analyzer_id = item.get("analyzerId")
+            category = item.get("category")
+            if not category and (analyzer_id is None or analyzer_id == result.get("result", {}).get("analyzerId")):
+                continue
+            page_start, page_end = _page_range(item)
+            raw_fields = item.get("fields") or {}
+            fields: dict[str, dict[str, Any]] = {}
+            for name, field in raw_fields.items():
+                fields[name] = {
+                    "value": _extract_value(field),
+                    "confidence": field.get("confidence"),
+                }
+            out.append({
+                "doc_type": category or item.get("kind") or "other",
+                "category": category,
+                "page_start": page_start,
+                "page_end": page_end,
+                "pages": (page_end - page_start + 1) if page_start and page_end else None,
+                "confidence": item.get("confidence"),
+                # The analyzer the service routed to (e.g., prebuilt-payStub.us).
+                # Surfaced in telemetry so KQL can group cost by extractor.
+                "analyzer_id": analyzer_id,
+                "fields": fields,
+            })
+        return out
+
+
+def _page_range(item: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Pull (start, end) 1-based page numbers from any of the CU response shapes.
+
+    GA (api-version 2025-11-01) returns `startPageNumber` / `endPageNumber` at
+    the top of each `contents[]` entry. Earlier preview shapes used either a
+    `pageRange` object or a `pages: "1-3"` string; we keep the fallbacks for
+    forward/backward compatibility.
+    """
+    sp = item.get("startPageNumber")
+    ep = item.get("endPageNumber")
+    if isinstance(sp, int) and isinstance(ep, int):
+        return sp, ep
+    pr = item.get("pageRange")
+    if isinstance(pr, dict) and pr.get("start") and pr.get("end"):
+        return int(pr["start"]), int(pr["end"])
+    pages = item.get("pages")
+    if isinstance(pages, str) and "-" in pages:
+        try:
+            s, e = pages.split("-", 1)
+            return int(s), int(e)
+        except ValueError:
+            return None, None
+    if isinstance(pages, int):
+        return pages, pages
+    return None, None
 
 
 def _extract_value(field: dict[str, Any]) -> Any:
