@@ -1,6 +1,6 @@
 # IDP Demo — Loan Application Review with Azure Document Intelligence
 
-A Python (FastAPI) demo that processes **merged loan-application PDFs** (paystub + bank statement + W-2) using **Azure AI Document Intelligence (DI)** on an **Azure AI Services** account. Demonstrates:
+A Python (FastAPI) demo that processes **merged loan-application PDFs** (paystub + bank statement + W-2) using **Azure AI Document Intelligence (DI)** and **Azure Content Understanding (CU)** on an **Microsoft Foundry** account. Demonstrates:
 
 - Multi-document PDF splitting (heuristic, trained DI custom classifier `idp-loan-docs-v1`, **and Content Understanding router**)
 - Prebuilt model routing (W-2, layout, ID document)
