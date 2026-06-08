@@ -2,11 +2,11 @@
 
 A Python (FastAPI) demo that processes **merged loan-application PDFs** (paystub + bank statement + W-2) using **Azure AI Document Intelligence (DI)** on an **Azure AI Services** account. Demonstrates:
 
-- Multi-document PDF splitting (heuristic **and** trained DI custom classifier `idp-loan-docs-v1`)
+- Multi-document PDF splitting (heuristic, trained DI custom classifier `idp-loan-docs-v1`, **and Content Understanding router**)
 - Prebuilt model routing (W-2, layout, ID document)
 - Confidence scoring & per-field telemetry
 - Per-tenant page-count + cost telemetry for SaaS cost allocation
-- Side-by-side compare mode (heuristic vs classifier) with KPI + savings UI
+- Side-by-side compare mode (heuristic vs classifier vs Content Understanding) with KPI + savings UI
 - Azure Load Testing scenario for throughput/cost projection
 
 ## Use cases covered in the demo
@@ -27,22 +27,25 @@ A Python (FastAPI) demo that processes **merged loan-application PDFs** (paystub
 Client ──POST /process (x-tenant-id, PDF)──▶ FastAPI (ca-api-demo)
                                               │
                                               ├─▶ Azure AI Services (DI) — split + extract
-                                              ├─▶ Application Insights — di.pages.processed
+                                              ├─▶ Content Understanding — router analyzer
+                                              ├─▶ Application Insights — telemetry
                                               └─▶ User-Assigned Managed Identity (no keys)
                                                     ├─ Cognitive Services User → AI account
                                                     └─ AcrPull → Container Registry
 ```
 
-### Two-stage billing model
+### Billing models by strategy
 
-Each request bills DI **twice** for traceable per-segment extraction:
+**Heuristic and Classifier** use a two-stage model where each request bills DI **twice** for traceable per-segment extraction:
 
-| Stage | Heuristic mode | Classifier mode |
-|---|---|---|
-| **1 — split** | one `prebuilt-layout` call over the full PDF | one `idp-loan-docs-v1` classifier call over the full PDF |
-| **2 — extract** | one call per segment, model chosen by doc type | one call per segment, model chosen by classifier label |
+| Stage | Heuristic mode | Classifier mode | Content Understanding mode |
+|---|---|---|---|
+| **1 — split** | one `prebuilt-layout` call over the full PDF | one `idp-loan-docs-v1` classifier call over the full PDF | N/A (single-call model) |
+| **2 — extract** | one call per segment, model chosen by doc type | one call per segment, model chosen by classifier label | Single `router` analyzer call |
 
-`billedPages = totalPages (stage 1) + Σ segmentPages (stage 2)`. Compare mode runs both pipelines and reports the dollar difference.
+For Heuristic/Classifier: `billedPages = totalPages (stage 1) + Σ segmentPages (stage 2)`.
+
+**Content Understanding** uses a single-call model: the router analyzer performs split, classification, and extraction in one operation. Billing is based on total pages processed once. Compare mode runs all three strategies and reports cost/latency differences.
 
 ---
 

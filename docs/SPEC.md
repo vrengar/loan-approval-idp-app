@@ -18,7 +18,7 @@ The service demonstrates an end-to-end **Intelligent Document Processing (IDP)**
 - **Routing** — sends each segment to the most appropriate prebuilt extraction model
 - **Extraction** — pulls structured fields and confidence scores
 - **Per-tenant cost telemetry** — every Document Intelligence call emits a structured event tagged with a tenant identifier so a SaaS operator can attribute spend per customer
-- **Compare mode** — runs the same input through both a fast heuristic splitter and a trained DI custom classifier, showing fields, latency, billed pages, and estimated cost side by side
+- **Compare mode** — runs the same input through all three strategies: fast heuristic splitter, trained DI custom classifier, and Content Understanding router analyzer, showing fields, latency, billed pages, and estimated cost side by side
 
 It is designed as a deployable reference for teams evaluating Azure AI Document Intelligence in a multi-tenant SaaS context.
 
@@ -44,11 +44,13 @@ It is designed as a deployable reference for teams evaluating Azure AI Document 
 │ Customer │ ──────────────────────────▶ │  FastAPI (ca-api-demo)  │
 │  (UI or  │   x-tenant-id: <id>          │                         │
 │   API)   │   multipart PDF              │  1. read PDF            │
-└──────────┘                              │  2. split (stage 1)     │
+└──────────┘                              │  2. split (strategy)    │
                                           │     ├─ heuristic, OR    │
-                                          │     └─ DI classifier    │
-                                          │  3. route segments      │
+                                          │     ├─ DI classifier, OR│
+                                          │     └─ CU router        │
+                                          │  3. route segments (H/C)│
                                           │  4. extract per segment │
+                                          │     (or single CU call) │
                                           │  5. emit telemetry      │
                                           │  6. return JSON         │
                                           └────────────┬────────────┘
@@ -57,10 +59,11 @@ It is designed as a deployable reference for teams evaluating Azure AI Document 
                                 ▼                      ▼                      ▼
                        ┌────────────────┐    ┌──────────────────┐   ┌─────────────────┐
                        │ Azure AI       │    │ Application      │   │ User-Assigned   │
-                       │ Services (DI)  │    │ Insights         │   │ Managed Identity│
-                       │ — prebuilt &   │    │ — di.pages.      │   │ — Cog Svcs User │
-                       │   custom       │    │   processed      │   │ — AcrPull       │
-                       └───────┬────────┘    └────────┬─────────┘   └─────────────────┘
+                       │ Services       │    │ Insights         │   │ Managed Identity│
+                       │ — DI prebuilt, │    │ — di.pages.      │   │ — Cog Svcs User │
+                       │   DI custom,   │    │   processed      │   │ — AcrPull       │
+                       │ — CU router    │    │ — cu.call.       │   └─────────────────┘
+                       └───────┬────────┘    │   processed      │
                                │ classifier            │
                                │ training data         ▼
                                ▼              Log Analytics workspace
@@ -69,16 +72,20 @@ It is designed as a deployable reference for teams evaluating Azure AI Document 
                         future uploads)
 ```
 
-### 3.2 Two-stage billing model
+### 3.2 Billing models by strategy
 
-Each document goes through Document Intelligence **twice** for traceable per-segment extraction:
+**Heuristic and Classifier strategies** use a two-stage model where each document goes through Document Intelligence **twice** for traceable per-segment extraction:
 
-| Stage | Heuristic mode | Classifier mode |
-|---|---|---|
-| **Stage 1 — split** | One call to `prebuilt-layout` over the full PDF (used for keyword-based boundary detection) | One call to the trained custom classifier (`idp-loan-docs-v1`) over the full PDF |
-| **Stage 2 — extract** | One call per detected segment, model chosen by document type | Same — one call per segment, model chosen by classifier label |
+| Stage | Heuristic mode | Classifier mode | Content Understanding mode |
+|---|---|---|---|
+| **Stage 1 — split** | One call to `prebuilt-layout` over the full PDF (used for keyword-based boundary detection) | One call to the trained custom classifier (`idp-loan-docs-v1`) over the full PDF | N/A (single-call model) |
+| **Stage 2 — extract** | One call per detected segment, model chosen by document type | Same — one call per segment, model chosen by classifier label | Single router analyzer call handles split + classify + extract |
 
-Billed pages = `total_pages (stage 1) + sum(segment_pages) (stage 2)`. Compare mode runs both pipelines and reports the difference so the operator can quantify the savings of investing in a trained classifier.
+For Heuristic/Classifier: Billed pages = `total_pages (stage 1) + sum(segment_pages) (stage 2)`.
+
+**Content Understanding strategy** uses a single-call model where the router analyzer performs split, classification, and extraction in one operation. Billing is based on total pages processed once, with no separate stage-1 and stage-2 calls. The router analyzer (typically `router-classifier-extract-{version}`) is deployed via [scripts/deploy_cu_classifier.py](../scripts/deploy_cu_classifier.py).
+
+Compare mode runs all three strategies and reports cost/latency differences so operators can quantify the trade-offs between implementation complexity, accuracy, and cost.
 
 ### 3.3 Deployed Azure resources (`infra/main.bicep`)
 
@@ -131,6 +138,7 @@ idp-app/
 │   ├── main.py                       # FastAPI app, /process, /healthz, embedded SPA UI
 │   ├── config.py                     # env-var resolution
 │   ├── di_client.py                  # DI SDK wrapper, MI auth, analyze() / classify()
+│   ├── cu_client.py                  # Content Understanding REST client
 │   ├── splitter.py                   # heuristic boundary detection + MODEL_BY_TYPE
 │   ├── splitter_classifier.py        # DI custom-classifier split path
 │   ├── derived.py                    # derived/aggregated fields (e.g. annualized income)
